@@ -1,0 +1,16 @@
+# Core deps (safe everywhere)
+vllm>=0.7.1
+transformers>=4.43,<5
+datasets>=2.20
+tqdm>=4.66
+math-verify[antlr4_13_2]>=0.4.0
+huggingface_hub>=0.24
+accelerate==1.10.0
+peft==0.17.0
+trl==0.21.0
+deepspeed==0.17.4
+wandb==0.21.1
+
+torch==2.7.1
+torchvision==0.22.1
+torchaudio==2.7.1
