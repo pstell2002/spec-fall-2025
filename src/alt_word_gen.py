@@ -51,7 +51,7 @@ class RayAsyncTextEngine:
         #     f"When the solution is complete, output exactly {FINISH_TOKEN} followed by {STOP_SENTINEL}.\n"
         #     "Do not output bullets or numbered lists."
         # )
-        system = (f"You are a helpful assistant. Answer step by step and output the final answer within \\boxed{}.")
+        system = (f"You are a helpful assistant. Answer step by step and output the final answer within \\boxed{{}} and then output {FINISH_TOKEN}.")
         # user = (
         #     f"Problem:\n{problem}\n\n"
         #     f"Solution so far:\n{solution_so_far}\n\n"
@@ -98,21 +98,24 @@ class RayAsyncTextEngine:
 
         if final is None or not final.outputs:
             return ""
-
+    
         piece = final.outputs[0].text or ""
+        piece = piece.strip()
         # Keep only what came before the sentinel
         # if STOP_SENTINEL in piece:
         #     piece = piece.split(STOP_SENTINEL, 1)[0]
         # piece = piece.split()[0]
 
         # If model claims it's finished, it should have output <END> first
-        # if piece.strip() == FINISH_TOKEN:
-        #     return FINISH_TOKEN
+        if piece.strip() == FINISH_TOKEN:
+             return FINISH_TOKEN
 
         # Reduce to a single "word-like" token for safety
         if piece:
             piece = piece.split()[0]
-        return piece
+            return piece
+        if not piece:
+            return ""  
 
 
 # ---------- Runner ----------
@@ -192,9 +195,9 @@ async def run(args):
                 piece = ray.get(ref).strip()
 
                 # Finish condition
-                # if piece == FINISH_TOKEN:
-                #     # don't add <END> to the context, just stop
-                #     break
+                if piece == FINISH_TOKEN:
+                    # don't add <END> to the context, just stop
+                    break
 
                 # filter: empties or trivial noise
                 # if not piece or piece in {"1", "1.", "-", "•"}:
@@ -245,7 +248,7 @@ async def run(args):
                     "max_tokens_per_word": args.max_tokens_per_word,
                     "seed": args.seed,
                     # "stop": [STOP_SENTINEL],   # <— only the sentinel now
-                    # "finish_token": FINISH_TOKEN,
+                    "finish_token": FINISH_TOKEN,
                 },
             }
             out_f.write(json.dumps(obj, ensure_ascii=False, indent=4) + "\n")
