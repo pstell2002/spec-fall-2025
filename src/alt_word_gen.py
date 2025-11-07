@@ -9,6 +9,7 @@ import ray
 import torch
 from datasets import load_dataset
 from tqdm import tqdm
+from score_math500 import score_file
 
 # Stop strings and explicit "I'm done" token
 STOP_SENTINEL = "</w>"
@@ -44,35 +45,20 @@ class RayAsyncTextEngine:
         We instruct it to output exactly ONE next word, then the sentinel </w>,
         or <END> when the solution is finished.
         """
-        # system = (
-        #     "You are a careful math solver. Continue the given solution one word at a time.\n"
-        #     "At each step, output exactly ONE next word (it may be a normal word, a number, or a math token), "
-        #     f"then immediately output the sentinel {STOP_SENTINEL}.\n"
-        #     f"When the solution is complete, output exactly {FINISH_TOKEN} followed by {STOP_SENTINEL}.\n"
-        #     "Do not output bullets or numbered lists."
-        # )
-        system = (f"You are a helpful assistant. Answer step by step and output the final answer within \\boxed{{}} and then output {FINISH_TOKEN}.")
-        # user = (
-        #     f"Problem:\n{problem}\n\n"
-        #     f"Solution so far:\n{solution_so_far}\n\n"
-        #     "Write exactly ONE next word that continues the solution naturally, "
-        #     f"then append {STOP_SENTINEL}. If the solution is finished, output "
-        #     f"{FINISH_TOKEN}{STOP_SENTINEL}."
-        # )
+
+        system = (f"You are a careful math solver. Answer step by step and output the final answer within \\boxed{{}} and then output {FINISH_TOKEN}.")
+
         user = (
             f"Problem:\n{problem}\n\n"
-            
         )
-        assistant = (
-            f"{solution_so_far}"
-        )
+
         messages = [
             {"role": "system", "content": system},
             {"role": "user", "content": user},
         ]
         prompt = self.tok.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
         prompt = prompt + solution_so_far  # continue from the solution so far
-        print(prompt)
+        # print(prompt)
         # raise NotImplementedError
         return prompt
 
@@ -101,10 +87,7 @@ class RayAsyncTextEngine:
     
         piece = final.outputs[0].text or ""
         piece = piece.strip()
-        # Keep only what came before the sentinel
-        # if STOP_SENTINEL in piece:
-        #     piece = piece.split(STOP_SENTINEL, 1)[0]
-        # piece = piece.split()[0]
+
 
         # If model claims it's finished, it should have output <END> first
         if piece.strip() == FINISH_TOKEN:
@@ -130,6 +113,10 @@ async def run(args):
     if args.append_timestamp:
         root, ext = os.path.splitext(out_path)
         out_path = f"{root}_{int(time.time())}{ext or '.jsonl'}"
+    compact_path = None
+    if args.also_compact:
+        os.makedirs(args.compact_dir, exist_ok=True)
+        compact_path = os.path.join(args.compact_dir, os.path.basename(out_path))
 
     # Spin up two actors (one per GPU)
     print("Loading Model A...")
@@ -157,7 +144,8 @@ async def run(args):
     base_seed_a = args.seed
     base_seed_b = args.seed + 100_000
 
-    with open(out_path, "w", encoding="utf-8") as out_f:
+    with open(out_path, "w", encoding="utf-8") as out_f, \
+     (open(compact_path, "w", encoding="utf-8") if compact_path else open(os.devnull, "w")) as out_fc:
         for i in tqdm(range(len(ds)), desc="Processing"):
             row = ds[i]
             problem = row["problem"]
@@ -199,23 +187,6 @@ async def run(args):
                     # don't add <END> to the context, just stop
                     break
 
-                # filter: empties or trivial noise
-                # if not piece or piece in {"1", "1.", "-", "•"}:
-                #     turn += 1
-                #     continue
-
-                # anti-loop: if repeated exact piece twice in a row, stop on the second
-                # if prev_piece is not None and piece == prev_piece:
-                #     dup_streak += 1
-                #     if dup_streak >= 4:
-                #         break
-                # else:
-                #     dup_streak = 0
-
-                # anti-loop: if same piece occurred >=3 times in recent window, stop
-                # if recent_count(piece, window=30) >= 4:
-                #     break
-
                 # Accept the piece
                 words_context.append(piece)
                 turns.append({"who": who, "piece": piece})
@@ -247,16 +218,39 @@ async def run(args):
                     "max_words": args.max_words,
                     "max_tokens_per_word": args.max_tokens_per_word,
                     "seed": args.seed,
-                    # "stop": [STOP_SENTINEL],   # <— only the sentinel now
                     "finish_token": FINISH_TOKEN,
                 },
             }
-            out_f.write(json.dumps(obj, ensure_ascii=False, indent=4) + "\n")
+            pretty_line = json.dumps(obj, ensure_ascii=False, indent=4)
+            out_f.write(pretty_line + "\n")
             out_f.flush()
             os.fsync(out_f.fileno())
+
+            # Compact twin (jq -c equivalent): separators remove spaces, no indent
+            if compact_path:
+                out_fc.write(json.dumps(obj, ensure_ascii=False, separators=(",", ":")) + "\n")
+                out_fc.flush()
+                os.fsync(out_fc.fileno())
             written += 1
 
     print(f"Wrote {written} items -> {out_path}")
+
+    try:
+        # Ensure PYTHONPATH includes src/ when you run this file, e.g.:
+        # PYTHONPATH=src:$PYTHONPATH python src/ex.py ...
+        target_path = compact_path if compact_path else out_path
+        acc, lo, hi, correct, total, csv_path = score_file(
+            preds_path=target_path,
+            csv_out=None,           # None -> auto name
+            float_precision=6,
+            prefer_extracted=True,  # use your \boxed extractor
+            conf_level=0.95,
+            env_debug=False,
+        )
+        print(f"[postrun] Accuracy {correct}/{total} = {acc:.3%} "
+            f"(95% CI: {lo:.3%}–{hi:.3%}); CSV: {csv_path}")
+    except Exception as e:
+        print(f"[postrun] scoring failed: {e}")
     ray.shutdown()
 
 
@@ -269,7 +263,7 @@ def main():
     ap.add_argument("--model_a", type=str, default="Qwen/Qwen2.5-0.5B-Instruct")
     ap.add_argument("--model_b", type=str, default="Qwen/Qwen2.5-7B-Instruct")
     ap.add_argument("--max-samples", dest="max_samples", type=int, default=100)
-    ap.add_argument("--max-words", dest="max_words", type=int, default=128)
+    ap.add_argument("--max-words", dest="max_words", type=int, default=500)
     ap.add_argument("--max-tokens-per-word", dest="max_tokens_per_word", type=int, default=12)
     ap.add_argument("--temperature", type=float, default=0.2)
     ap.add_argument("--top-p", dest="top_p", type=float, default=0.95)
@@ -282,6 +276,8 @@ def main():
     ap.add_argument("--max-model-len", dest="max_model_len", type=int, default=4096,
                     help="Target context budget; enforced by vLLM engine.")
     ap.add_argument("--gpu-mem-util", dest="gpu_mem_util", type=float, default=0.90)
+    ap.add_argument("--also-compact", action="store_true", default=True, help="Also emit a compact one-line-per-object JSONL alongside the pretty file.")
+    ap.add_argument("--compact-dir", type=str, default="outputs/compact", help="Directory to write the compact JSONL copy.")
 
     args = ap.parse_args()
     asyncio.run(run(args))

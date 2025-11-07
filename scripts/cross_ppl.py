@@ -1,4 +1,4 @@
-# scripts/offline_cross_ppl.py
+# scripts/cross_ppl.py
 import argparse, json, math, os, sys, time, logging
 from typing import Dict, List, Tuple
 
@@ -247,6 +247,35 @@ def main():
                             f"B_on_A ppl={res_b['ppl']:.3f} tok={res_b['tok']}")
 
     logger.info(f"Done. Wrote {written} rows to {args.outp}")
+
+        # ---- Micro-average perplexity (always print) ----
+    def compute_micro_avgs(out_path: str):
+        total_nll_a = total_tok_a = 0
+        total_nll_b = total_tok_b = 0
+        with open(out_path, "r", encoding="utf-8") as rf:
+            for line in rf:
+                o = json.loads(line)
+                m = o.get("metrics_offline", {})
+                nll_a = m.get("cross_nll_A_on_B")
+                tok_a = m.get("cross_tok_A_on_B", 0)
+                nll_b = m.get("cross_nll_B_on_A")
+                tok_b = m.get("cross_tok_B_on_A", 0)
+                if nll_a is not None and math.isfinite(nll_a) and tok_a > 0:
+                    total_nll_a += nll_a * tok_a
+                    total_tok_a += tok_a
+                if nll_b is not None and math.isfinite(nll_b) and tok_b > 0:
+                    total_nll_b += nll_b * tok_b
+                    total_tok_b += tok_b
+        micro_ppl_a = math.exp(total_nll_a / total_tok_a) if total_tok_a > 0 else float("nan")
+        micro_ppl_b = math.exp(total_nll_b / total_tok_b) if total_tok_b > 0 else float("nan")
+        return micro_ppl_a, micro_ppl_b, total_tok_a, total_tok_b
+
+    micro_ppl_a, micro_ppl_b, total_tok_a, total_tok_b = compute_micro_avgs(args.outp)
+    logger.info(
+        "Micro-averaged perplexity (token-weighted): "
+        f"A_on_B={micro_ppl_a:.4f} over {total_tok_a} tokens | "
+        f"B_on_A={micro_ppl_b:.4f} over {total_tok_b} tokens"
+    )
 
     # CSV rollup
     if args.csv:

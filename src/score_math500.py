@@ -299,16 +299,116 @@ def read_json_records(path: str) -> List[Dict]:
 
     return rows
 
+def _z_for_conf(conf: float) -> float:
+    """
+    Two-sided z for common confidence levels. Falls back to 1.96 if unknown.
+    """
+    table = {
+        0.80: 1.281551565545,
+        0.85: 1.439531470938,
+        0.90: 1.644853626951,
+        0.95: 1.959963984540,
+        0.98: 2.326347874041,  # actually ~0.99; kept a few common ones
+        0.99: 2.575829303549,
+        0.999: 3.290526731492,
+    }
+    # Snap to common values to avoid float mismatch (e.g., 0.9500000001)
+    for k in table:
+        if abs(conf - k) < 1e-9:
+            return table[k]
+    return table.get(round(conf, 3), 1.959963984540)
+
+def wilson_interval(k: int, n: int, conf: float = 0.95) -> Tuple[float, float]:
+    """
+    Wilson score interval for a binomial proportion.
+    Returns (lower, upper) for accuracy = k/n.
+    """
+    if n <= 0:
+        return (0.0, 0.0)
+    p = k / n
+    z = _z_for_conf(conf)
+    z2 = z * z
+    denom = 1.0 + z2 / n
+    center = (p + z2 / (2.0 * n)) / denom
+    margin = (z * ((p * (1.0 - p) / n) + (z2 / (4.0 * n * n))) ** 0.5) / denom
+    return max(0.0, center - margin), min(1.0, center + margin)
 
 # ============= Main =============
+
+# --- Public helper so other scripts can call the scorer ---
+def score_file(
+    preds_path: str,
+    csv_out: str | None = None,
+    float_precision: int = 6,
+    prefer_extracted: bool = True,
+    conf_level: float = 0.95,
+    env_debug: bool = False,
+) -> tuple[float, float, float, int, int, str]:
+    """
+    Returns (acc, ci_lo, ci_hi, correct, total, csv_path)
+    and prints the same summary the CLI prints.
+    """
+    if env_debug:
+        os.environ["SCORE_DEBUG"] = "1"
+
+    # Reuse your existing functions:
+    preds = read_json_records(preds_path)
+    correct = 0
+    total = 0
+    rows_for_csv: list[dict] = []
+
+    for obj in preds:
+        gold_raw_orig = (obj.get("gold_answer") or "").strip()
+        pred_full_orig = (obj.get("generation") or "").strip()
+
+        gold_extracted = sanitize_math(extract_answer(gold_raw_orig))
+        pred_extracted = sanitize_math(extract_answer(pred_full_orig) if prefer_extracted else pred_full_orig)
+
+        try:
+            is_correct = compare_answers(gold_extracted, pred_extracted, float_precision, debug=env_debug)
+        except Exception:
+            is_correct = False
+
+        total += 1
+        correct += int(is_correct)
+
+        rows_for_csv.append({
+            "idx": obj.get("idx"),
+            "unique_id": obj.get("unique_id"),
+            "subject": obj.get("subject"),
+            "level": obj.get("level"),
+            "model": obj.get("model"),
+            "is_correct": int(is_correct),
+            "gold": gold_raw_orig,
+            "gold_extracted": gold_extracted,
+            "prediction": pred_full_orig,
+            "prediction_extracted": pred_extracted,
+        })
+
+    acc = correct / max(total, 1)
+    lo, hi = wilson_interval(correct, total, conf=conf_level) if total > 0 else (0.0, 0.0)
+    print(f"Accuracy: {correct}/{total} = {acc:.3%}  [Wilson {conf_level:.2f} CI: {lo:.3%}, {hi:.3%}]")
+
+    out_csv = csv_out or preds_path.replace(".jsonl", "_scored.csv")
+    if rows_for_csv:
+        with open(out_csv, "w", newline="", encoding="utf-8") as f:
+            fieldnames = list(rows_for_csv[0].keys())
+            w = csv.DictWriter(f, fieldnames=fieldnames)
+            w.writeheader()
+            for r in rows_for_csv:
+                w.writerow(r)
+        print(f"Wrote per-item scores -> {out_csv}")
+
+    return acc, lo, hi, correct, total, out_csv
+
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--preds", required=True, help="Path to generations (JSONL or pretty-printed)")
     ap.add_argument("--csv-out", default=None, help="Optional path for per-item CSV")
     ap.add_argument("--float-precision", type=int, default=6, help="Numeric precision for comparisons")
-    ap.add_argument("--prefer-extracted", action="store_true",
-                    help="Extract final answer (e.g., \\[\\boxed{...}\\]) from 'generation' before verifying.")
+    ap.add_argument("--prefer-extracted", action="store_true", help="Extract final answer (e.g., \\[\\boxed{...}\\]) from 'generation' before verifying.")
+    ap.add_argument("--conf-level", type=float, default=0.95, help="Confidence level for Wilson CI (e.g., 0.95)")
     args = ap.parse_args()
 
     debug = bool(os.environ.get("SCORE_DEBUG"))
@@ -351,7 +451,9 @@ def main():
         })
 
     acc = correct / max(total, 1)
-    print(f"Accuracy: {correct}/{total} = {acc:.3%}")
+    lo, hi = wilson_interval(correct, total, conf=args.conf_level) if total > 0 else (0.0, 0.0)
+    print(f"Accuracy: {correct}/{total} = {acc:.3%}  "
+          f"[Wilson {args.conf_level:.2f} CI: {lo:.3%}, {hi:.3%}]")
 
     out_csv = args.csv_out or args.preds.replace(".jsonl", "_scored.csv")
     if rows_for_csv:
